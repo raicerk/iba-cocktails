@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  scraper:
+    build:
+      context: scraping-iba
+      dockerfile: Dockerfile
+    container_name: cocktail_scraper
+    volumes:
+      - ./scraping-iba:/app
+
+  cocktail-rag-api:
+    depends_on:
+      scraper:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: cocktail_rag_service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./scraping-iba:/app/data
+      # Monta la caché de HuggingFace en el host para no re-descargar modelos al reiniciar
+      - hf_cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+volumes:
+  hf_cache:
