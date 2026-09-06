@@ -4,15 +4,25 @@ import json
 import torch
 import numpy as np
 from typing import Optional, List
-from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware  # <-- 1. Importar middleware
 
 app = FastAPI(
     title="Cocktail Knowledge Base & Local RAG API",
     version="1.0.0",
     description="API RESTful unificada con endpoints de consulta y RAG local."
+)
+
+# <-- 2. Configurar CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # O especifica ["http://localhost:3000"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ------------------------------------------------------------------------------

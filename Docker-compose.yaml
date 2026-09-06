@@ -25,5 +25,18 @@ services:
       - hf_cache:/root/.cache/huggingface
     restart: unless-stopped
 
+  web-app:
+    build:
+      context: ./web-app
+    ports:
+      - "3000:3000"
+    environment:
+      # Usar el nombre del servicio de la API de backend (ej: cocktail-rag-api) 
+      # en lugar de localhost si se comunican por la red interna de Docker.
+      # O localhost si es que el navegador hace el llamado desde tu PC
+      - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1/cocktails
+    depends_on:
+      - cocktail-rag-api # o como se llame tu servicio api
+
 volumes:
   hf_cache:
