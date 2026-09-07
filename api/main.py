@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware  # <-- 1. Importar middleware
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="Cocktail Knowledge Base & Local RAG API",
@@ -16,14 +16,17 @@ app = FastAPI(
     description="API RESTful unificada con endpoints de consulta y RAG local."
 )
 
-# <-- 2. Configurar CORS
+# Configurar CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # O especifica ["http://localhost:3000"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mensaje estandarizado para consultas fuera de dominio
+OUT_OF_DOMAIN_RESPONSE = "Lo siento, solo puedo responder preguntas relacionadas con el catálogo de coctelería y sus ingredientes."
 
 # ------------------------------------------------------------------------------
 # 1. CARGA DE DATOS Y CONFIGURACIÓN DEL RAG LOCAL
@@ -42,14 +45,8 @@ except FileNotFoundError:
 def normalize_string(text: str) -> str:
     return text.lower().strip()
 
-# Construir el conjunto de ingredientes y un índice inverso palabra → ingredientes.
-# Esto permite detectar dinámicamente cualquier ingrediente mencionado en la pregunta
-# sin necesidad de mantener una lista hardcodeada.
 ALL_INGREDIENTS: set[str] = set()
-# Mapea cada palabra individual de un ingrediente al nombre completo del ingrediente.
-# Ej: "dry gin" → {"dry": {"dry gin"}, "gin": {"dry gin"}}
 INGREDIENT_WORD_INDEX: dict[str, set[str]] = {}
-# Palabras demasiado genéricas que no deben usarse para matchear ingredientes
 _STOP_WORDS = {
     "fresh", "juice", "simple", "sugar", "syrup", "cream", "dry", "old",
     "sweet", "double", "single", "strong", "light", "dark", "white", "red",
@@ -71,7 +68,7 @@ for c in COCKTAILS_DB:
 
 print(f"Ingredientes indexados: {len(ALL_INGREDIENTS)}, palabras clave: {len(INGREDIENT_WORD_INDEX)}")
 
-# A. Preparar los documentos del catálogo
+# Preparar los documentos del catálogo
 documents = []
 for c in COCKTAILS_DB:
     ing_str = ", ".join([f"{i.get('amount', '')} {i.get('unit', '')} {i.get('ingredient', '')}".strip() for i in c.get("ingredients", [])])
@@ -83,14 +80,13 @@ for c in COCKTAILS_DB:
         "text": doc_text
     })
 
-# B. Cargar Modelo de Embeddings e Indexar Vectores en Memoria
+# Cargar Modelo de Embeddings e Indexar Vectores
 print("Cargando modelo local de embeddings...")
 embedder = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 doc_texts = [d["text"] for d in documents]
 doc_embeddings = embedder.encode(doc_texts, convert_to_tensor=True)
 
-# C. Cargar Modelo Generativo Local (SLM)
-# Se utiliza Qwen2.5-0.5B-Instruct o TinyLlama como modelo ligero de inferencia
+# Cargar Modelo Generativo Local (SLM)
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct" 
 print(f"Cargando modelo LLM local ({MODEL_NAME})...")
 
@@ -176,23 +172,19 @@ def get_cocktail_by_slug(slug: str):
     return cocktail
 
 # ------------------------------------------------------------------------------
-# 4. ENDPOINT RAG LOCAL (BÚSQUEDA COSENO + INFERENCIA LOCAL)
+# 4. ENDPOINT RAG LOCAL (BÚSQUEDA COSENO + INFERENCIA LOCAL CON GUARDRAILS)
 # ------------------------------------------------------------------------------
 
 def _detect_ingredient(question: str) -> str | None:
     """Detecta dinámicamente un ingrediente en la pregunta usando el índice
-    construido a partir de los datos del scraping (INGREDIENT_WORD_INDEX).
-    No usa ninguna lista hardcodeada de ingredientes."""
+    construido a partir de los datos del scraping (INGREDIENT_WORD_INDEX)."""
     lower_q = question.lower()
     question_words = set(re.findall(r"\w+", lower_q))
 
-    # 1. Buscar coincidencia exacta: ¿alguna palabra de la pregunta es una
-    #    palabra clave de un ingrediente?
     for word in question_words:
         if word in INGREDIENT_WORD_INDEX:
-            return word  # ej: "gin", "vodka", "tequila", "rum", "bourbon"…
+            return word
 
-    # 2. Fallback: intentar extraer la palabra que sigue a "con" o "with"
     m = re.search(r"(?:con|with)\s+(\w+)", lower_q)
     if m:
         candidate = m.group(1)
@@ -205,10 +197,22 @@ def _detect_ingredient(question: str) -> str | None:
 @app.post("/api/v1/cocktails/rag", response_model=RAGResponse, summary="Consulta RAG local")
 def query_rag(request: RAGQueryRequest):
     try:
-        # 1. Detectar ingrediente mencionado en la pregunta
+        # 1. Calcular embedding de la pregunta y validar similitud con la BD de cócteles
+        query_embedding = embedder.encode(request.question, convert_to_tensor=True)
+        cos_scores = torch.nn.functional.cosine_similarity(query_embedding, doc_embeddings)
+        max_score = torch.max(cos_scores).item()
+
+        # GUARDRAIL 1: Si la similitud máxima es menor a 0.30, la pregunta no trata de cócteles
+        if max_score < 0.30:
+            return RAGResponse(
+                question=request.question,
+                answer=OUT_OF_DOMAIN_RESPONSE,
+                cocktails=[]
+            )
+
+        # 2. Detectar si la pregunta especifica un ingrediente en particular
         asked_ingredient = _detect_ingredient(request.question)
 
-        # 2. Filtrar cócteles: si se detectó ingrediente, filtrar; si no, usar todos.
         if asked_ingredient:
             filtered_cocktails = [
                 c for c in COCKTAILS_DB
@@ -218,46 +222,73 @@ def query_rag(request: RAGQueryRequest):
                 )
             ]
         else:
-            # Sin ingrediente detectado → búsqueda vectorial pura (top‑k)
-            query_embedding = embedder.encode(request.question, convert_to_tensor=True)
-            cos_scores = torch.nn.functional.cosine_similarity(query_embedding, doc_embeddings)
-            top_results = torch.topk(cos_scores, k=10)
+            top_results = torch.topk(cos_scores, k=min(10, len(COCKTAILS_DB)))
             filtered_cocktails = [COCKTAILS_DB[idx.item()] for idx in top_results.indices]
 
-        # 3. Construir contexto sólo con los cócteles filtrados
-        filtered_names = {c.get("name") for c in filtered_cocktails}
+        if not filtered_cocktails:
+            return RAGResponse(
+                question=request.question,
+                answer=OUT_OF_DOMAIN_RESPONSE,
+                cocktails=[]
+            )
+
+        # 3. Construir contexto limitando a los 5 más relevantes
+        filtered_names = {c.get("name") for c in filtered_cocktails[:5]}
         context = "\n---\n".join(
             d["text"] for d in documents if d["name"] in filtered_names
         )
 
-        # 4. Prompt para el LLM
-        prompt = f"""Eres un bartender experto. Usa **únicamente** la información del siguiente contexto para responder la pregunta del usuario.
-**No inventes** cócteles ni ingredientes que no aparezcan en el contexto.
+        # GUARDRAIL 2: Prompt estructurado en formato ChatML oficial para Qwen
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Eres un asistente virtual especializado EXCLUSIVAMENTE en coctelería y recetas de bebidas.\n"
+                    "REGLAS ESTRITAS:\n"
+                    "1. Responde ÚNICAMENTE basándote en la información del contexto proporcionado.\n"
+                    "2. Si la pregunta trata sobre programación (Java, Python, C++, etc.), matemáticas o cualquier tema ajeno a los cócteles, responde exactamente: "
+                    f"'{OUT_OF_DOMAIN_RESPONSE}'\n"
+                    "3. No generes código fuente de programación bajo ninguna circunstancia."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Contexto:\n{context}\n\nPregunta: {request.question}"
+            }
+        ]
 
-Contexto:
-{context}
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
 
-Pregunta: {request.question}
-
-Respuesta:"""
-
-        # 5. Generación de respuesta con el modelo local
+        # 4. Inferencia con baja temperatura para evitar alucinaciones/desvíos
         output = generator(
-            prompt,
-            max_new_tokens=250,
-            temperature=0.1,
+            formatted_prompt,
+            max_new_tokens=150,
+            temperature=0.01,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
-        generated_text = output[0]["generated_text"]
-        # Extraer sólo la respuesta generada (después del último "Respuesta:")
-        answer = generated_text.split("Respuesta:")[-1].strip()
 
-        # 6. Devolver respuesta + lista de cócteles filtrados con formato completo
+        generated_text = output[0]["generated_text"]
+
+        # Parsear la respuesta descartando el prompt del sistema y del usuario
+        if "<|im_start|>assistant\n" in generated_text:
+            answer = generated_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
+        else:
+            answer = generated_text[len(formatted_prompt):].strip()
+
+        # GUARDRAIL 3: Post-filtro para detener respuestas que intenten incluir sintaxis de código
+        code_keywords = ["public class", "import java", "void main", "```java", "```python", "System.out"]
+        if any(kw in answer for kw in code_keywords):
+            answer = OUT_OF_DOMAIN_RESPONSE
+
         return RAGResponse(
             question=request.question,
             answer=answer,
-            cocktails=filtered_cocktails,
+            cocktails=filtered_cocktails if answer != OUT_OF_DOMAIN_RESPONSE else [],
         )
 
     except Exception as e:

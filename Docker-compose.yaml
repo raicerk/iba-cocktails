@@ -9,7 +9,7 @@ services:
     volumes:
       - ./scraping-iba:/app
 
-  cocktail-rag-api:
+  api:
     depends_on:
       scraper:
         condition: service_completed_successfully
@@ -36,7 +36,7 @@ services:
       # O localhost si es que el navegador hace el llamado desde tu PC
       - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1/cocktails
     depends_on:
-      - cocktail-rag-api # o como se llame tu servicio api
+      - api # o como se llame tu servicio api
 
 volumes:
   hf_cache:
