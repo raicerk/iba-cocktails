@@ -16,7 +16,6 @@ app = FastAPI(
     description="API RESTful unificada con endpoints de consulta y RAG local."
 )
 
-# Configurar CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,8 +24,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mensaje estandarizado para consultas fuera de dominio
 OUT_OF_DOMAIN_RESPONSE = "Lo siento, solo puedo responder preguntas relacionadas con el catálogo de coctelería y sus ingredientes."
+
+OUT_OF_DOMAIN_KEYWORDS = [
+    "java", "python", "javascript", "c++", "c#", "php", "sql", "html", "css",
+    "código", "codigo", "algoritmo", "función", "funcion", "clase", "array",
+    "matemática", "matematica", "ecuación", "ecuacion", "ejercicio de"
+]
 
 # ------------------------------------------------------------------------------
 # 1. CARGA DE DATOS Y CONFIGURACIÓN DEL RAG LOCAL
@@ -44,6 +48,12 @@ except FileNotFoundError:
 
 def normalize_string(text: str) -> str:
     return text.lower().strip()
+
+def contains_exact_word(target_word: str, text: str) -> bool:
+    """Verifica si target_word existe como palabra completa dentro del texto,
+    evitando coincidencias parciales como 'citron' o 'strong' para 'ron'."""
+    pattern = r'\b' + re.escape(normalize_string(target_word)) + r'\b'
+    return bool(re.search(pattern, normalize_string(text)))
 
 ALL_INGREDIENTS: set[str] = set()
 INGREDIENT_WORD_INDEX: dict[str, set[str]] = {}
@@ -68,7 +78,6 @@ for c in COCKTAILS_DB:
 
 print(f"Ingredientes indexados: {len(ALL_INGREDIENTS)}, palabras clave: {len(INGREDIENT_WORD_INDEX)}")
 
-# Preparar los documentos del catálogo
 documents = []
 for c in COCKTAILS_DB:
     ing_str = ", ".join([f"{i.get('amount', '')} {i.get('unit', '')} {i.get('ingredient', '')}".strip() for i in c.get("ingredients", [])])
@@ -80,13 +89,11 @@ for c in COCKTAILS_DB:
         "text": doc_text
     })
 
-# Cargar Modelo de Embeddings e Indexar Vectores
 print("Cargando modelo local de embeddings...")
 embedder = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 doc_texts = [d["text"] for d in documents]
 doc_embeddings = embedder.encode(doc_texts, convert_to_tensor=True)
 
-# Cargar Modelo Generativo Local (SLM)
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct" 
 print(f"Cargando modelo LLM local ({MODEL_NAME})...")
 
@@ -117,7 +124,7 @@ class RAGResponse(BaseModel):
     cocktails: List[dict]
 
 # ------------------------------------------------------------------------------
-# 3. ENDPOINTS REST CONVENCIONALES
+# 3. ENDPOINTS REST CONVENCIONALES (CORREGIDOS CON PALABRA EXACTA)
 # ------------------------------------------------------------------------------
 
 @app.get("/api/v1/cocktails", summary="Listar todos los cócteles")
@@ -129,13 +136,13 @@ def get_cocktails(
     results = COCKTAILS_DB
 
     if name:
-        results = [c for c in results if normalize_string(name) in normalize_string(c["name"])]
+        results = [c for c in results if contains_exact_word(name, c["name"])]
     if category:
-        results = [c for c in results if normalize_string(category) in normalize_string(c["category"])]
+        results = [c for c in results if contains_exact_word(category, c["category"])]
     if ingredient:
         results = [
             c for c in results 
-            if any(normalize_string(ingredient) in normalize_string(i["ingredient"]) for i in c.get("ingredients", []))
+            if any(contains_exact_word(ingredient, i.get("ingredient", "")) for i in c.get("ingredients", []))
         ]
 
     return {"total": len(results), "cocktails": results}
@@ -143,23 +150,22 @@ def get_cocktails(
 
 @app.get("/api/v1/cocktails/search", summary="Búsqueda por nombre")
 def search_cocktails(q: str = Query(...)):
-    matches = [c for c in COCKTAILS_DB if normalize_string(q) in normalize_string(c["name"])]
+    matches = [c for c in COCKTAILS_DB if contains_exact_word(q, c["name"])]
     return {"total": len(matches), "cocktails": matches}
 
 
 @app.get("/api/v1/cocktails/category/{category_name}", summary="Filtrar por categoría")
 def get_by_category(category_name: str):
-    target = normalize_string(category_name).replace("-", " ")
-    matches = [c for c in COCKTAILS_DB if target in normalize_string(c["category"])]
+    target = category_name.replace("-", " ")
+    matches = [c for c in COCKTAILS_DB if contains_exact_word(target, c["category"])]
     return {"category": category_name, "total": len(matches), "cocktails": matches}
 
 
 @app.get("/api/v1/cocktails/ingredient/{ingredient_name}", summary="Filtrar por ingrediente")
 def get_by_ingredient(ingredient_name: str):
-    target = normalize_string(ingredient_name)
     matches = [
         c for c in COCKTAILS_DB 
-        if any(target in normalize_string(i["ingredient"]) for i in c.get("ingredients", []))
+        if any(contains_exact_word(ingredient_name, i.get("ingredient", "")) for i in c.get("ingredients", []))
     ]
     return {"ingredient": ingredient_name, "total": len(matches), "cocktails": matches}
 
@@ -172,20 +178,22 @@ def get_cocktail_by_slug(slug: str):
     return cocktail
 
 # ------------------------------------------------------------------------------
-# 4. ENDPOINT RAG LOCAL (BÚSQUEDA COSENO + INFERENCIA LOCAL CON GUARDRAILS)
+# 4. ENDPOINT RAG LOCAL (MATCH EXACTO DE INGREDIENTES)
 # ------------------------------------------------------------------------------
 
 def _detect_ingredient(question: str) -> str | None:
-    """Detecta dinámicamente un ingrediente en la pregunta usando el índice
-    construido a partir de los datos del scraping (INGREDIENT_WORD_INDEX)."""
-    lower_q = question.lower()
-    question_words = set(re.findall(r"\w+", lower_q))
+    """Detecta ingredientes en la pregunta mediante limites de palabra exactos."""
+    question_words = set(re.findall(r"\b\w+\b", question.lower()))
+
+    # Manejar sinónimos/traducciones comunes
+    if "ron" in question_words or "rum" in question_words:
+        return "rum"
 
     for word in question_words:
         if word in INGREDIENT_WORD_INDEX:
             return word
 
-    m = re.search(r"(?:con|with)\s+(\w+)", lower_q)
+    m = re.search(r"\b(?:con|with)\s+(\w+)\b", question.lower())
     if m:
         candidate = m.group(1)
         if candidate in INGREDIENT_WORD_INDEX:
@@ -197,63 +205,71 @@ def _detect_ingredient(question: str) -> str | None:
 @app.post("/api/v1/cocktails/rag", response_model=RAGResponse, summary="Consulta RAG local")
 def query_rag(request: RAGQueryRequest):
     try:
-        # 1. Calcular embedding de la pregunta y validar similitud con la BD de cócteles
-        query_embedding = embedder.encode(request.question, convert_to_tensor=True)
-        cos_scores = torch.nn.functional.cosine_similarity(query_embedding, doc_embeddings)
-        max_score = torch.max(cos_scores).item()
+        lower_question = request.question.lower()
 
-        # GUARDRAIL 1: Si la similitud máxima es menor a 0.30, la pregunta no trata de cócteles
-        if max_score < 0.30:
+        # GUARDRAIL 0: Intercepta código/programación directo
+        if any(keyword in lower_question for keyword in OUT_OF_DOMAIN_KEYWORDS):
             return RAGResponse(
                 question=request.question,
                 answer=OUT_OF_DOMAIN_RESPONSE,
                 cocktails=[]
             )
 
-        # 2. Detectar si la pregunta especifica un ingrediente en particular
+        # 1. Similitud Vectorial
+        query_embedding = embedder.encode(request.question, convert_to_tensor=True)
+        cos_scores = torch.nn.functional.cosine_similarity(query_embedding, doc_embeddings)
+        max_score = torch.max(cos_scores).item()
+
+        if max_score < 0.25:
+            return RAGResponse(
+                question=request.question,
+                answer=OUT_OF_DOMAIN_RESPONSE,
+                cocktails=[]
+            )
+
+        # 2. Filtrado de Cócteles con Verificación Exacta de Palabras
         asked_ingredient = _detect_ingredient(request.question)
 
         if asked_ingredient:
+            # Aceptar "rum" o "ron" interchangeablemente
+            target_words = ["rum", "ron"] if asked_ingredient in ["rum", "ron"] else [asked_ingredient]
+            
             filtered_cocktails = [
                 c for c in COCKTAILS_DB
                 if any(
-                    asked_ingredient in normalize_string(i.get("ingredient", ""))
+                    any(contains_exact_word(tw, i.get("ingredient", "")) for tw in target_words)
                     for i in c.get("ingredients", [])
                 )
             ]
         else:
-            top_results = torch.topk(cos_scores, k=min(10, len(COCKTAILS_DB)))
+            top_results = torch.topk(cos_scores, k=min(5, len(COCKTAILS_DB)))
             filtered_cocktails = [COCKTAILS_DB[idx.item()] for idx in top_results.indices]
 
         if not filtered_cocktails:
             return RAGResponse(
                 question=request.question,
-                answer=OUT_OF_DOMAIN_RESPONSE,
+                answer=f"No encontré cócteles en el catálogo que contengan el ingrediente solicitado.",
                 cocktails=[]
             )
 
-        # 3. Construir contexto limitando a los 5 más relevantes
+        # 3. Formatear Contexto Limpio
         filtered_names = {c.get("name") for c in filtered_cocktails[:5]}
         context = "\n---\n".join(
             d["text"] for d in documents if d["name"] in filtered_names
         )
 
-        # GUARDRAIL 2: Prompt estructurado en formato ChatML oficial para Qwen
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "Eres un asistente virtual especializado EXCLUSIVAMENTE en coctelería y recetas de bebidas.\n"
-                    "REGLAS ESTRITAS:\n"
-                    "1. Responde ÚNICAMENTE basándote en la información del contexto proporcionado.\n"
-                    "2. Si la pregunta trata sobre programación (Java, Python, C++, etc.), matemáticas o cualquier tema ajeno a los cócteles, responde exactamente: "
-                    f"'{OUT_OF_DOMAIN_RESPONSE}'\n"
-                    "3. No generes código fuente de programación bajo ninguna circunstancia."
+                    "Eres un bartender experto y amigable. Tu función es recomendar cócteles e indicar sus ingredientes "
+                    "y preparación basándote EXCLUSIVAMENTE en el contexto provisto.\n"
+                    "Responde con tono servicial, detallando la receta recomendada."
                 )
             },
             {
                 "role": "user",
-                "content": f"Contexto:\n{context}\n\nPregunta: {request.question}"
+                "content": f"Contexto disponible:\n{context}\n\nPregunta del cliente: {request.question}"
             }
         ]
 
@@ -263,40 +279,42 @@ def query_rag(request: RAGQueryRequest):
             add_generation_prompt=True
         )
 
-        # 4. Inferencia con baja temperatura para evitar alucinaciones/desvíos
+        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        eos_ids = [tokenizer.eos_token_id]
+        if im_end_id is not None:
+            eos_ids.append(im_end_id)
+
         output = generator(
             formatted_prompt,
-            max_new_tokens=150,
-            temperature=0.01,
-            do_sample=False,
+            max_new_tokens=400,
+            temperature=0.3,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            do_sample=True,
             pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=eos_ids,
         )
 
         generated_text = output[0]["generated_text"]
 
-        # Parsear la respuesta descartando el prompt del sistema y del usuario
         if "<|im_start|>assistant\n" in generated_text:
             answer = generated_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
         else:
             answer = generated_text[len(formatted_prompt):].strip()
 
-        # GUARDRAIL 3: Post-filtro para detener respuestas que intenten incluir sintaxis de código
-        code_keywords = ["public class", "import java", "void main", "```java", "```python", "System.out"]
-        if any(kw in answer for kw in code_keywords):
+        code_keywords = ["public class", "import java", "void main", "```java", "```python", "system.out"]
+        if any(kw in answer.lower() for kw in code_keywords):
             answer = OUT_OF_DOMAIN_RESPONSE
 
         return RAGResponse(
             question=request.question,
             answer=answer,
-            cocktails=filtered_cocktails if answer != OUT_OF_DOMAIN_RESPONSE else [],
+            cocktails=filtered_cocktails,
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en el RAG local: {str(e)}")
 
-# ------------------------------------------------------------------------------
-# EJECUCIÓN DEL SERVIDOR
-# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
